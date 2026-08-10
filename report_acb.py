@@ -74,10 +74,11 @@ CONTEXTO DE MÉTRICAS (para interpretar, NO para inventar valores):
 - "avanzadas" son estadísticas avanzadas OFICIALES de acb.com: Cuatro Factores (eFG%, ORB%, TOV%, FTr), manejo de balón (AST%, STL%, BLK%, TOV%), lanzamiento (TS%, eFG%, 3PAr, PPT), puntos por 100 posesiones y ritmo.
 - "per40" es la normalización europea a 40 minutos, calculada sobre promedios reales.
 - "_rankings_liga" son los puestos del jugador en los rankings oficiales de la Liga Endesa: úsalos, dan mucho contexto.
+- "trayectoria" es la serie temporada a temporada de TODA su carrera ACB (con el club de cada año): úsala para el arco de carrera — evolución, picos, cesiones o cambios de equipo, y tendencia reciente.
 
 Devuelve EXACTAMENTE este esquema JSON (sin campos extra, sin Markdown):
 {{
-  "resumen_desempeno": "Párrafo de 110-160 palabras. Compara temporada vs carrera si ambas existen. Apóyate en Valoración, TS%/eFG% oficiales, Cuatro Factores y per-40. Cita números concretos del JSON.",
+  "resumen_desempeno": "Párrafo de 110-160 palabras. Compara temporada vs carrera si ambas existen. Apóyate en Valoración, TS%/eFG% oficiales, Cuatro Factores y per-40. Cita números concretos del JSON y usa la trayectoria para señalar la tendencia (mejora, meseta o delcive) con temporadas concretas.",
   "foda": {{
     "fortalezas": ["2-3 puntos, máx. 25 palabras cada uno"],
     "oportunidades": ["2-3 puntos"],
@@ -288,6 +289,23 @@ def render_html(player_data: Dict[str, Any], analisis: Dict[str, Any]) -> str:
     avanz = est.get("avanzadas") or {}
     if avanz:
         stats_html += _tabla_avanzadas(avanz)
+
+    trayectoria = est.get("trayectoria") or []
+    if len(trayectoria) >= 2:
+        filas = [
+            [t.get("Temporada", "—"), t.get("Club", "—"), t.get("PJ", "—"),
+             t.get("Minutos", "—"), t.get("Puntos", "—"), t.get("%2P", "—"),
+             t.get("%3P", "—"), t.get("%TL", "—"), t.get("Rebotes", "—"),
+             t.get("Asistencias", "—"), t.get("Valoración", "—")]
+            for t in trayectoria[:12]
+        ]
+        titulo_tray = "Trayectoria en ACB temporada a temporada"
+        if len(trayectoria) > 12:
+            titulo_tray += f" (últimas 12 de {len(trayectoria)})"
+        stats_html += _tabla(
+            titulo_tray, filas,
+            ["Temp", "Club", "PJ", "MIN", "PTS", "%2P", "%3P", "%TL", "REB", "AST", "VAL"],
+        )
 
     records = est.get("records") or {}
     if records:

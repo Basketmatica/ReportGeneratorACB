@@ -227,25 +227,98 @@ def _jugadores_de_plantilla(team_url: str, edition_id: Optional[int]) -> List[Di
     return []
 
 
+def _urls_desde_sitemap_xml(xml: str) -> List[str]:
+    """Extrae las URLs <loc> de un sitemap (o sub-sitemaps de un índice)."""
+    return re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", xml)
+
+
+def _jugadores_desde_sitemap() -> List[Dict[str, str]]:
+    """
+    Fuente independiente de la temporada: el sitemap oficial de jugadores
+    (mismo patrón verificado que /sitemaps/entrenadores/sitemap.xml).
+    Cubre TODOS los jugadores con ficha en acb.com, históricos incluidos.
+    Sin nombre visible ni equipo (solo slug); se completan después.
+    """
+    indices_candidatos = [
+        f"{BASE}/sitemaps/jugadores/sitemap.xml",
+        "https://acb.com/sitemaps/jugadores/sitemap.xml",
+    ]
+    paginas: List[str] = []
+    for idx_url in indices_candidatos:
+        try:
+            xml = _get_html(idx_url)
+        except Exception as exc:
+            logger.warning("Sitemap no accesible (%s): %s", idx_url, exc)
+            continue
+        locs = _urls_desde_sitemap_xml(xml)
+        if not locs:
+            continue
+        # ¿Índice de sub-sitemaps o sitemap de URLs finales?
+        if any(".xml" in u for u in locs):
+            paginas = [u for u in locs if ".xml" in u]
+        else:
+            paginas = [idx_url]  # las URLs finales están aquí mismo
+        break
+    if not paginas:
+        return []
+
+    jugadores: Dict[str, Dict[str, str]] = {}
+    for pag in paginas:
+        try:
+            xml = _get_html(pag)
+        except Exception as exc:
+            logger.warning("Página de sitemap no accesible (%s): %s", pag, exc)
+            continue
+        for loc in _urls_desde_sitemap_xml(xml):
+            m = _PLAYER_HREF_RE.search(loc)
+            if not m:
+                continue
+            slug, pid = m.group(1), m.group(2)
+            jugadores[pid] = {
+                "id": pid,
+                "slug": slug,
+                "display": "",
+                "url": f"{BASE}/es/liga/jugadores/{slug}-{pid}",
+            }
+    logger.info("Sitemap de jugadores: %d fichas", len(jugadores))
+    return list(jugadores.values())
+
+
 def construir_indice_jugadores() -> List[Dict[str, str]]:
     """
-    Índice de todos los jugadores de la temporada con datos (18 plantillas).
-    ~19 peticiones. Cachéalo aguas arriba (st.cache_data) — cambia poco.
+    Índice de jugadores con dos fuentes en cascada:
+
+      1. Plantillas de los 18 equipos (~19 peticiones). La mejor fuente en
+         temporada: aporta nombre visible y equipo. En PRETEMPORADA las
+         plantillas están vacías ("La plantilla se publicará cuando haya
+         datos oficiales") y el parámetro editionId es ignorado, así que…
+      2. Sitemap oficial de jugadores (2-10 peticiones). Independiente de la
+         temporada y cubre también históricos; solo aporta el slug (el
+         equipo se completa después desde la propia ficha).
     """
     edition_id = descubrir_edition_id()
     logger.info("editionId con datos: %s", edition_id)
+
     indice: Dict[str, Dict[str, str]] = {}
     for team_url in _urls_equipos():
         for j in _jugadores_de_plantilla(team_url, edition_id):
             j["equipo_url"] = team_url
             indice[j["id"]] = j
-    logger.info("Índice construido: %d jugadores", len(indice))
-    if not indice:
-        raise RuntimeError(
-            "No se pudo construir el índice de jugadores desde acb.com. "
-            "La estructura del sitio puede haber cambiado."
-        )
-    return list(indice.values())
+
+    if indice:
+        logger.info("Índice construido desde plantillas: %d jugadores", len(indice))
+        return list(indice.values())
+
+    logger.info("Plantillas vacías (pretemporada) → usando sitemap de jugadores…")
+    desde_sitemap = _jugadores_desde_sitemap()
+    if desde_sitemap:
+        logger.info("Índice construido desde sitemap: %d jugadores", len(desde_sitemap))
+        return desde_sitemap
+
+    raise RuntimeError(
+        "No se pudo construir el índice de jugadores desde acb.com "
+        "(ni plantillas ni sitemap). La estructura del sitio puede haber cambiado."
+    )
 
 
 def resolver_jugador(
@@ -432,6 +505,12 @@ def _parse_ficha(html: str) -> Dict[str, Any]:
     if m_dorsal >= 0:
         datos["dorsal"] = lineas[m_dorsal].split("·")[0].strip()
 
+    for a in soup.find_all("a", href=True):
+        m_eq = _TEAM_HREF_RE.search(urlparse(a["href"]).path)
+        if m_eq:
+            datos["equipo_url"] = f"{BASE}/es/liga/equipos/{m_eq.group(1)}"
+            break
+
     # Temporada mostrada (la última con datos si no se pasa editionId).
     i_temp = _idx(lineas, lambda s: re.match(r"^Temporada \d{4}-\d{2}$", s) is not None)
     i_carr = _idx(lineas, lambda s: s == "Carrera", max(i_temp, 0))
@@ -534,6 +613,56 @@ def _parse_avanzadas(html: str) -> Dict[str, Any]:
         )
     return out
 
+# ─── Parser de la trayectoria temporada a temporada ───────────────────────────
+
+# Columnas de la tabla /temporada (verificadas ago-2026, 31 celdas por fila):
+_COLS_TEMPORADAS = [
+    "Temporada", "Club", "PJ", "Minutos", "5i",
+    "Puntos", "Puntos_max",
+    "T3_conv", "T3_int", "%3P",
+    "T2_conv", "T2_int", "%2P",
+    "TL_conv", "TL_int", "%TL",
+    "Reb_of", "Reb_def", "Rebotes",
+    "Asistencias", "Recuperaciones", "Pérdidas",
+    "Tap_favor", "Tap_contra", "Mates",
+    "Faltas_com", "Faltas_rec", "+/-", "Valoración", "V", "D",
+]
+
+_TEMP_ROW_RE = re.compile(r"^\d{2}-\d{2}$")
+
+
+def _parse_temporadas(html: str) -> List[Dict[str, str]]:
+    """
+    Tabla 'Temporadas' de la ficha (/temporada): una fila por temporada ACB
+    con el club de ese año. La página pinta un esqueleto vacío y después la
+    tabla real; nos quedamos solo con filas de temporada con datos.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    temporadas: Dict[str, Dict[str, str]] = {}
+    for table in soup.find_all("table"):
+        for tr in table.find_all("tr"):
+            celdas = tr.find_all(["td", "th"])
+            if not celdas:
+                continue
+            textos = [" ".join(c.get_text(" ").split()) for c in celdas]
+            if not _TEMP_ROW_RE.match(textos[0] or ""):
+                continue
+            if len(textos) != len(_COLS_TEMPORADAS):
+                logger.warning(
+                    "Fila de temporada con %d celdas (esperadas %d): %s",
+                    len(textos), len(_COLS_TEMPORADAS), textos[:3],
+                )
+                continue
+            fila = dict(zip(_COLS_TEMPORADAS, textos))
+            # El club viene como enlace; el texto del <a> es el nombre oficial.
+            a = celdas[1].find("a")
+            if a:
+                fila["Club"] = " ".join(a.get_text(" ").split())
+            # Solo filas con contenido real (el esqueleto viene vacío).
+            if fila.get("PJ") and fila.get("Puntos"):
+                temporadas[fila["Temporada"]] = fila
+    # Más reciente primero (formato 'AA-AA' ordena bien como string).
+    return sorted(temporadas.values(), key=lambda f: f["Temporada"], reverse=True)
 
 # ─── Métrica derivada: per-40 ─────────────────────────────────────────────────
 
@@ -601,13 +730,20 @@ def obtener_datos_jugador_acb(
     except Exception as exc:
         logger.warning("Avanzadas no disponibles para %s: %s", entrada["slug"], exc)
 
+    trayectoria: List[Dict[str, str]] = []
+    try:
+        trayectoria = _parse_temporadas(_get_html(f"{entrada['url']}/temporada"))
+    except Exception as exc:
+        logger.warning("Trayectoria no disponible para %s: %s", entrada["slug"], exc)
+
     bio_raw = ficha.get("bio", {})
     nombre_display = entrada.get("display") or entrada["slug"].replace("-", " ").title()
 
     # Equipo: derivarlo de la URL del equipo del índice ('real-madrid-9' → 'Real Madrid').
     equipo = "–"
-    if entrada.get("equipo_url"):
-        slug_eq = entrada["equipo_url"].rstrip("/").split("/")[-1]
+    equipo_url = entrada.get("equipo_url") or ficha.get("equipo_url")
+    if equipo_url:
+        slug_eq = equipo_url.rstrip("/").split("/")[-1]
         equipo = re.sub(r"-\d+$", "", slug_eq).replace("-", " ").title()
 
     datos_personales: Dict[str, Any] = {
@@ -643,6 +779,8 @@ def obtener_datos_jugador_acb(
         estadisticas["records"] = ficha["records"]
     if avanzadas:
         estadisticas["avanzadas"] = avanzadas
+    if trayectoria:
+        estadisticas["trayectoria"] = trayectoria
 
     if len(estadisticas) <= 1:
         logger.warning(
