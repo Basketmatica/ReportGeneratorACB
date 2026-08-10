@@ -92,7 +92,13 @@ Devuelve EXACTAMENTE este esquema JSON (sin campos extra, sin Markdown):
   ]
 }}
 
-Reglas: básate al 100% en los datos del JSON; no inventes lesiones, contratos ni contexto de mercado; si un dato es "–", ignóralo."""
+REGLAS DE RIGOR (obligatorias, prevalecen sobre todo lo demás):
+1. Compara SOLO pares de valores que estén AMBOS en el JSON. Si el homólogo de carrera de una métrica no existe, NO compares: describe el valor en solitario. Prohibido citar cualquier número que no aparezca literalmente en el JSON.
+2. Direccionalidad: TOV% y Pérdidas significan mejor cuanto MÁS BAJOS. TS%, eFG%, AST%, %2P, %3P, %TL y AST/BP significan mejor cuanto más altos. Un TOV% bajo (<13) en un exterior con AST% alto es seguridad de balón de élite: FORTALEZA, jamás debilidad.
+3. Ancla todo juicio de nivel ("élite", "top", "pobre") en "_rankings_liga" si existe; sin ranking que lo respalde, describe el dato sin calificarlo.
+4. Temporadas con PJ < 10 son muestra no significativa: exclúyelas de tendencias y no cites sus porcentajes.
+5. Prohibido mencionar defensa, lesiones, contratos, vestuario o minutos futuros si el JSON no contiene un dato que lo respalde. Cada punto del FODA debe citar al menos un número del JSON.
+6. En la tendencia de la trayectoria: di meseta, descenso o mejora según los números reales, no la narrativa amable. Un pico anterior seguido de valores menores es meseta o leve descenso, no "mejora"."""
 
 
 # ─── Render HTML determinista ─────────────────────────────────────────────────
@@ -188,22 +194,39 @@ def _linea_rankings(stats: Dict[str, Any]) -> str:
 
 
 def _tabla_avanzadas(avanz: Dict[str, Any]) -> str:
-    """Aplana los bloques oficiales de acb.com en una tabla métrica→valor."""
+    """
+    Aplana los bloques oficiales de acb.com en una tabla métrica→valor,
+    SIN duplicados (eFG%, TOV% y ORB% aparecen en dos bloques del sitio).
+    """
     filas: List[List[str]] = []
+    vistas: set = set()
     for bloque in ("Cuatro Factores", "Lanzamiento", "Manejo de Balón", "Puntos", "Rebotes"):
         contenido = avanz.get(bloque)
-        if isinstance(contenido, dict):
-            for metrica, valor in contenido.items():
-                filas.append([f"{metrica} ({bloque})", str(valor)])
+        if not isinstance(contenido, dict):
+            continue
+        for metrica, valor in contenido.items():
+            if metrica in vistas:
+                continue
+            vistas.add(metrica)
+            filas.append([metrica, str(valor)])
     if avanz.get("PTS_100_posesiones"):
-        filas.append(["Puntos por 100 posesiones", str(avanz["PTS_100_posesiones"])])
+        filas.append(["PTS/100 posesiones", str(avanz["PTS_100_posesiones"])])
     if avanz.get("Posesiones_40min"):
         filas.append(["Posesiones por 40'", str(avanz["Posesiones_40min"])])
     if not filas:
         return ""
-    return _tabla(
+    tabla = _tabla(
         "Estadísticas avanzadas (oficiales acb.com)", filas, ["Métrica", "Valor"]
     )
+    leyenda = (
+        f'<p style="font-size:10.5px;color:{INK_SOFT};margin:-14px 0 20px;line-height:1.5;">'
+        "eFG%: % de tiro efectivo · TS%: % de tiro real · FTr: tiros libres intentados por "
+        "tiro de campo · 3PAr: proporción de intentos de 3 · TOV%: % de pérdidas por posesión · "
+        "AST%/ORB%/DRB%/STL%/BLK%: % de asistencias, rebotes of./def., robos y tapones del "
+        "equipo generados por el jugador · PPT: puntos por tiro · PPFT/PP2PS/PP3PS: puntos por "
+        "tiro libre / lanzamiento de 2 / lanzamiento de 3.</p>"
+    )
+    return tabla + leyenda
 
 
 def _seccion_foda(foda: Dict[str, List[str]]) -> str:
@@ -228,6 +251,45 @@ def _seccion_foda(foda: Dict[str, List[str]]) -> str:
         '<div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;'
         f'margin-bottom:24px;">{secciones}</div>'
     )
+
+def _num_es(v: Any) -> Optional[float]:
+    """'4,3' -> 4.3 | '89,9%' -> 89.9 | '22:05' -> 22.08 (min decimales)."""
+    s = str(v or "").strip().replace("%", "").strip()
+    if ":" in s:
+        try:
+            mm, ss = s.split(":")
+            return round(int(mm) + int(ss) / 60.0, 2)
+        except ValueError:
+            return None
+    try:
+        return float(s.replace(".", "").replace(",", ".")) if "," in s else float(s)
+    except ValueError:
+        return None
+
+
+def _ratios_calculados(est: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Ratios derivados de la fila de la temporada actual en la trayectoria
+    (la única fuente de la ficha con pérdidas e intentos de tiro por partido).
+    Aritmética sobre datos reales; se etiqueta como 'calculado'.
+    """
+    tray = est.get("trayectoria") or []
+    label = str(est.get("temporada_label", ""))  # '2025-26' -> '25-26'
+    corto = label[2:] if len(label) >= 7 else label
+    fila = next((t for t in tray if t.get("Temporada") == corto), None)
+    if fila is None:
+        return {}
+    out: Dict[str, str] = {}
+    ast = _num_es(fila.get("Asistencias"))
+    bp = _num_es(fila.get("Pérdidas"))
+    if ast is not None and bp and bp > 0:
+        out["AST/BP"] = f"{ast / bp:.1f}".replace(".", ",")
+    if fila.get("Pérdidas") not in (None, ""):
+        out["Pérdidas/partido"] = str(fila.get("Pérdidas"))
+    t3i = fila.get("T3_int")
+    if t3i not in (None, ""):
+        out["Triples intentados/partido"] = str(t3i)
+    return out
 
 
 def render_html(player_data: Dict[str, Any], analisis: Dict[str, Any]) -> str:
@@ -280,6 +342,12 @@ def render_html(player_data: Dict[str, Any], analisis: Dict[str, Any]) -> str:
         if p40:
             cab, fila = _fila_stats(p40, _ORDEN_P40)
             stats_html += _tabla("Per-40 minutos (calculado)", [fila], cab)
+            ratios = est.get("ratios_calculados") or {}
+            if ratios:
+                stats_html += _tabla(
+                    "Ratios y volumen (calculado)",
+                    [[k, v] for k, v in ratios.items()], ["Métrica", "Valor"],
+                )
 
     carrera = est.get("carrera") or {}
     if carrera:
@@ -389,6 +457,10 @@ def generar_pdf_jugador_acb(
         max_tokens=2500,
     )
 
+    est = player_data.get("Estadísticas", {})
+    ratios = _ratios_calculados(est)
+    if ratios:
+        est["ratios_calculados"] = ratios
     html_doc = render_html(player_data, analisis)
     pdf: bytes = HTML(string=html_doc).write_pdf()
     logger.info("✓ PDF generado (%d KB).", len(pdf) // 1024)

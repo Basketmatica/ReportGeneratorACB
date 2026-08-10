@@ -505,12 +505,6 @@ def _parse_ficha(html: str) -> Dict[str, Any]:
     if m_dorsal >= 0:
         datos["dorsal"] = lineas[m_dorsal].split("·")[0].strip()
 
-    for a in soup.find_all("a", href=True):
-        m_eq = _TEAM_HREF_RE.search(urlparse(a["href"]).path)
-        if m_eq:
-            datos["equipo_url"] = f"{BASE}/es/liga/equipos/{m_eq.group(1)}"
-            break
-
     # Temporada mostrada (la última con datos si no se pasa editionId).
     i_temp = _idx(lineas, lambda s: re.match(r"^Temporada \d{4}-\d{2}$", s) is not None)
     i_carr = _idx(lineas, lambda s: s == "Carrera", max(i_temp, 0))
@@ -741,10 +735,11 @@ def obtener_datos_jugador_acb(
 
     # Equipo: derivarlo de la URL del equipo del índice ('real-madrid-9' → 'Real Madrid').
     equipo = "–"
-    equipo_url = entrada.get("equipo_url") or ficha.get("equipo_url")
-    if equipo_url:
-        slug_eq = equipo_url.rstrip("/").split("/")[-1]
+    if entrada.get("equipo_url"):
+        slug_eq = entrada["equipo_url"].rstrip("/").split("/")[-1]
         equipo = re.sub(r"-\d+$", "", slug_eq).replace("-", " ").title()
+    elif trayectoria:
+        equipo = trayectoria[0].get("Club", "–")
 
     datos_personales: Dict[str, Any] = {
         "Nombre": nombre_display,
