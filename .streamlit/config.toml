@@ -1,0 +1,24 @@
+[theme]
+# --accent (teal): rellenos de botón, foco de input, spinner, sliders.
+primaryColor = "#1F8A74"
+
+# --bg: fondo papel/crema.
+backgroundColor = "#F4EFE5"
+
+# --surface: tarjetas, inputs, expanders. Más CLARO que el fondo, al revés
+# que en la mayoría de temas: es correcto, así se elevan las superficies.
+secondaryBackgroundColor = "#FBF8F0"
+
+# --ink: negro cálido, nunca #000.
+textColor = "#221A10"
+
+# Dialecto EDITORIAL para el cuerpo (--font-body = Source Serif 4).
+# Streamlit solo admite "sans serif" | "serif" | "monospace" aquí;
+# las familias reales se cargan por @import en streamlit_app.py.
+font = "serif"
+
+[client]
+toolbarMode = "minimal"
+
+[server]
+headless = true
