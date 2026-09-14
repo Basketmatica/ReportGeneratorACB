@@ -193,6 +193,18 @@ def _urls_equipos() -> List[str]:
     return urls
 
 
+_ALT_LOGO_RE = re.compile(r"^Logo equipo de\s+(.+)$", re.I)
+
+
+def _nombre_tarjeta(a) -> str:
+    # El texto del enlace mezcla dorsal, altura, posición, edad…; el alt del logo trae el nombre limpio.
+    for img in a.find_all("img", alt=True):
+        m = _ALT_LOGO_RE.match(img["alt"].strip())
+        if m:
+            return m.group(1).strip()
+    return " ".join(a.get_text(" ").split()).strip()
+
+
 def _jugadores_de_plantilla(team_url: str, edition_id: Optional[int]) -> List[Dict[str, str]]:
     """Enlaces a jugadores en la plantilla de un equipo (con fallback de edición)."""
     candidatos_url = [f"{team_url}/plantilla"]
@@ -213,7 +225,7 @@ def _jugadores_de_plantilla(team_url: str, edition_id: Optional[int]) -> List[Di
             if not m:
                 continue
             slug, pid = m.group(1), m.group(2)
-            display = " ".join(a.get_text(" ").split()).strip()
+            display = _nombre_tarjeta(a)
             prev = jugadores.get(pid)
             if prev is None or (display and len(display) > len(prev.get("display", ""))):
                 jugadores[pid] = {

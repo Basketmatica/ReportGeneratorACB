@@ -454,7 +454,7 @@ def generar_pdf_jugador_acb(
         _prompt_analisis(player_data),
         proveedores,
         system=_SYSTEM,
-        max_tokens=2500,
+        max_tokens=3500,
     )
 
     est = player_data.get("Estadísticas", {})

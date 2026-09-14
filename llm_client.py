@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -69,6 +70,19 @@ PRESETS: Dict[str, Dict[str, str]] = {
 }
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
+
+# Esperas cortas ante 429: los límites por minuto se liberan en segundos; si el
+# proveedor pide esperar más (p. ej. cupo diario agotado), pasamos al siguiente.
+MAX_REINTENTOS_429 = 2
+ESPERA_MAX_429_S = 12.0
+
+
+def _espera_429(r: httpx.Response, reintento: int) -> Optional[float]:
+    try:
+        espera = float(r.headers.get("retry-after", ""))
+    except ValueError:
+        espera = 2.0 * (reintento + 1)
+    return espera + 0.5 if espera <= ESPERA_MAX_429_S else None
 
 
 @dataclass
@@ -165,12 +179,17 @@ def generar_json(
             headers["HTTP-Referer"] = "https://basketmatica.com"
             headers["X-Title"] = "Basketmatica Report Generator"
 
-        for intento_payload in (payload, {k: v for k, v in payload.items() if k != "response_format"}):
+        usar_response_format = True
+        reintentos_429 = 0
+        while True:
+            body = payload if usar_response_format else {
+                k: v for k, v in payload.items() if k != "response_format"
+            }
             try:
                 r = httpx.post(
                     f"{prov.base_url}/chat/completions",
                     headers=headers,
-                    json=intento_payload,
+                    json=body,
                     timeout=httpx.Timeout(90.0, connect=10.0),
                 )
             except httpx.HTTPError as exc:
@@ -186,15 +205,25 @@ def generar_json(
                     )
                     resultado["_modelo"] = f"{prov.name}/{prov.model}"
                     return resultado
-                except (KeyError, IndexError, json.JSONDecodeError) as exc:
+                except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
                     errores.append(f"{prov.name}: respuesta inválida ({exc})")
                     break
-            if r.status_code == 400 and "response_format" in intento_payload:
-                continue  # reintenta sin response_format
-            if r.status_code in (401, 403):
-                errores.append(f"{prov.name}: clave inválida (HTTP {r.status_code})")
-            elif r.status_code == 429:
+            if r.status_code == 400 and usar_response_format:
+                usar_response_format = False
+                continue
+            if r.status_code == 429:
+                espera = _espera_429(r, reintentos_429)
+                if espera is not None and reintentos_429 < MAX_REINTENTOS_429:
+                    reintentos_429 += 1
+                    logger.warning(
+                        "%s: rate limit (429), reintento %d en %.1f s",
+                        prov.name, reintentos_429, espera,
+                    )
+                    time.sleep(espera)
+                    continue
                 errores.append(f"{prov.name}: rate limit (429)")
+            elif r.status_code in (401, 403):
+                errores.append(f"{prov.name}: clave inválida (HTTP {r.status_code})")
             else:
                 errores.append(f"{prov.name}: HTTP {r.status_code}")
             break  # siguiente proveedor
