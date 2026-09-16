@@ -16,6 +16,7 @@ Secrets (Streamlit Cloud → Settings → Secrets):
 
 from __future__ import annotations
 
+import html
 import json
 import logging
 import os
@@ -32,8 +33,9 @@ logging.basicConfig(
 logger = logging.getLogger("acb-report")
 
 from acb_data import construir_indice_jugadores, obtener_datos_jugador_acb  # noqa: E402
+from informe_comun import preparar_vista  # noqa: E402
 from llm_client import cargar_proveedores  # noqa: E402
-from report_acb import generar_pdf_jugador_acb  # noqa: E402
+from report_acb import COMPETICION, construir_vista, generar_pdf_jugador_acb  # noqa: E402
 
 # ─── Design tokens (espejo de :root en global.css) ────────────────────────────
 BG = "#F4EFE5"
@@ -220,13 +222,14 @@ if enviar:
         with st.spinner("Buscando al jugador en acb.com…"):
             data = datos_jugador(nombre.lower())
 
-        dp = data.get("Datos personales", {})
-        est = data.get("Estadísticas", {})
-        temporada = est.get("temporada_label", "")
+        vista = preparar_vista(construir_vista(data), COMPETICION)
+        jugador = vista.get("jugador", {})
+        nombre_jugador = jugador.get("Nombre") or nombre
+        temporada = vista.get("temporada", {}).get("etiqueta", "")
         st.markdown(
-            f'<p class="bm-meta"><strong>{dp.get("Nombre", nombre)}</strong> · '
-            f'{dp.get("Equipo", "—")}'
-            + (f" · Temporada {temporada}" if temporada else "")
+            f'<p class="bm-meta"><strong>{html.escape(nombre_jugador)}</strong> · '
+            f'{html.escape(jugador.get("Equipo", "—"))}'
+            + (f" · Temporada {html.escape(temporada)}" if temporada else "")
             + "</p>",
             unsafe_allow_html=True,
         )
@@ -237,12 +240,12 @@ if enviar:
         st.download_button(
             label="⬇  Descargar informe PDF",
             data=pdf,
-            file_name=f"{_safe_filename(dp.get('Nombre', nombre))}_Report.pdf",
+            file_name=f"{_safe_filename(nombre_jugador)}_Report.pdf",
             mime="application/pdf",
         )
 
-        with st.expander("Ver datos extraídos (JSON)"):
-            st.json(data)
+        with st.expander("Ver datos del informe (JSON)"):
+            st.json({k: v for k, v in vista.items() if k not in ("foto", "alias")})
 
     except ValueError as exc:
         st.error(str(exc))
@@ -256,8 +259,9 @@ if enviar:
 
 st.markdown(
     '<div class="bm-nota">Todos los valores proceden de la ficha oficial del '
-    "jugador en acb.com, incluidas las estadísticas avanzadas; la única métrica "
-    "calculada es per-40 y se etiqueta como tal. El modelo de IA solo redacta "
-    "el texto analítico sobre esos mismos datos, sin intervenir en las cifras.</div>",
+    "jugador en acb.com, incluidas las estadísticas avanzadas. Las métricas que "
+    "calcula Basketmática (per-40 y ratios) se etiquetan siempre como calculadas. "
+    "El modelo de IA solo redacta el texto analítico sobre esos mismos datos, "
+    "sin intervenir en las cifras.</div>",
     unsafe_allow_html=True,
 )

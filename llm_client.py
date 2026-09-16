@@ -6,7 +6,7 @@ OpenAI (chat/completions), así que un único cliente sirve para todos:
 
     Proveedor    base_url                                      ejemplo de modelo
     ─────────    ───────────────────────────────────────────   ─────────────────────────────
-    groq         https://api.groq.com/openai/v1                llama-3.3-70b-versatile
+    groq         https://api.groq.com/openai/v1                openai/gpt-oss-120b
     openrouter   https://openrouter.ai/api/v1                  meta-llama/llama-3.3-70b-instruct:free
     cerebras     https://api.cerebras.ai/v1                    gpt-oss-120b
     mistral      https://api.mistral.ai/v1                     mistral-small-latest
@@ -18,7 +18,7 @@ Se configura por secrets/env, con cadena de fallback opcional:
     GROQ_API_KEY = "..."
     OPENROUTER_API_KEY = "..."
     # Overrides opcionales:
-    GROQ_MODEL = "llama-3.3-70b-versatile"
+    GROQ_MODEL = "openai/gpt-oss-120b"
     OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
 
 El cliente pide SIEMPRE una respuesta JSON (los generadores ya no piden HTML
@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 PRESETS: Dict[str, Dict[str, str]] = {
     "groq": {
         "base_url": "https://api.groq.com/openai/v1",
-        "model": "llama-3.3-70b-versatile",
+        "model": "openai/gpt-oss-120b",
         "key_name": "GROQ_API_KEY",
     },
     "openrouter": {

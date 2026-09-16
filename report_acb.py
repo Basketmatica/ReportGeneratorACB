@@ -1,257 +1,76 @@
 """
-report_acb.py — Nombre → datos ACB → análisis (LLM, JSON) → HTML (Python) → PDF.
+report_acb.py — Datos de acb.com → vista del informe → PDF.
 
-Misma arquitectura que el generador NBA v2:
-
-  * El LLM NO genera HTML. Solo redacta el análisis (desempeño, FODA,
-    proyección, similares) como JSON compacto (~1K tokens) vía llm_client
-    (Groq / OpenRouter / Cerebras / Gemini, con fallback en cadena).
-  * Las tablas las renderiza Python desde los datos scrapeados de acb.com →
-    los números del PDF no pasan por el modelo (imposible alucinarlos) y
-    cabemos en los límites de cualquier free tier.
-  * Devuelve bytes (st.download_button), sin ficheros temporales.
-  * Design tokens reales de basketmatica.com (teal/espresso/court).
+Solo contiene lo propio de la Liga Endesa: la configuración de la competición,
+la vista construida desde acb_data y los ratios calculados. El prompt, la
+normalización del texto de la IA y el render son comunes (informe_comun.py,
+idéntico en el generador NBA).
 """
 
 from __future__ import annotations
 
-import html
-import json
 import logging
-from typing import Any, Dict, List, Optional, Tuple
-
-from weasyprint import HTML
+import re
+from typing import Any, Dict, List, Optional
 
 from acb_data import obtener_datos_jugador_acb
-from llm_client import ProviderConfig, generar_json
+from informe_comun import Competicion, generar_pdf
+from llm_client import ProviderConfig
 
 logger = logging.getLogger(__name__)
 
-# ─── Design tokens Basketmática (espejo de :root en global.css) ───────────────
-BG = "#F4EFE5"         # --bg
-SURFACE = "#FBF8F0"    # --surface
-LINE = "#E2D8C4"       # --line
-INK = "#221A10"        # --ink
-INK_SOFT = "#6E5E46"   # --ink-soft
-BRAND = "#583C14"      # --brand (espresso: titulares e identidad)
-ACCENT = "#1F8A74"     # --accent (teal: filetes, highlights de datos)
-ACCENT_600 = "#176B5A"
-SPOT = "#E8772E"       # --spot (uso puntual)
-COURT = "#1B140D"      # --court (cabeceras de tabla oscuras)
-COURT_INK = "#EFE8DA"  # --court-ink
-
-# FODA: teal = funciona · spot = potencial · rojo (único hex fuera de tokens,
-# candidato a --negative en global.css) = debilidades · ink-soft = contexto.
-FODA_FORTALEZAS = ACCENT
-FODA_OPORTUNIDADES = SPOT
-FODA_DEBILIDADES = "#A8442F"
-FODA_AMENAZAS = INK_SOFT
-
-FONT_BODY = "Georgia,'Times New Roman',serif"
-
-LOGO_URL = "https://basketmatica.wordpress.com/wp-content/uploads/2024/07/logo_basketmatica.png"
-
-
-# ─── Prompt de análisis (solo JSON) ───────────────────────────────────────────
-
-_SYSTEM = (
-    "Eres un analista profesional de baloncesto europeo especializado en "
-    "estadística avanzada y scouting de la Liga Endesa (ACB). Escribes para "
-    "Basketmática: registro sobrio y técnico, sin épica. Respondes SIEMPRE "
-    "con un único objeto JSON válido, sin Markdown."
-)
-
-
-def _prompt_analisis(player_data: Dict[str, Any]) -> str:
-    return f"""A partir de este JSON con datos REALES de un jugador de la Liga Endesa (ACB), extraídos de acb.com, redacta el análisis en ESPAÑOL.
-
-=== DATOS ===
-{json.dumps(player_data, ensure_ascii=False)}
-=============
-
-CONTEXTO DE MÉTRICAS (para interpretar, NO para inventar valores):
-- "Valoración" es el índice oficial europeo (PIR), LA métrica de referencia en ACB.
-- "avanzadas" son estadísticas avanzadas OFICIALES de acb.com: Cuatro Factores (eFG%, ORB%, TOV%, FTr), manejo de balón (AST%, STL%, BLK%, TOV%), lanzamiento (TS%, eFG%, 3PAr, PPT), puntos por 100 posesiones y ritmo.
-- "per40" es la normalización europea a 40 minutos, calculada sobre promedios reales.
-- "_rankings_liga" son los puestos del jugador en los rankings oficiales de la Liga Endesa: úsalos, dan mucho contexto.
-- Si existe "_nota_temporada", la temporada en curso aún no ha empezado y "temporada" es la última completa: no interpretes la temporada nueva como ausencia o falta de participación del jugador.
-- "trayectoria" es la serie temporada a temporada de TODA su carrera ACB (con el club de cada año): úsala para el arco de carrera — evolución, picos, cesiones o cambios de equipo, y tendencia reciente.
-
-Devuelve EXACTAMENTE este esquema JSON (sin campos extra, sin Markdown):
-{{
-  "resumen_desempeno": "Párrafo de 110-160 palabras. Compara temporada vs carrera si ambas existen. Apóyate en Valoración, TS%/eFG% oficiales, Cuatro Factores y per-40. Cita números concretos del JSON y usa la trayectoria para señalar la tendencia (mejora, meseta o delcive) con temporadas concretas.",
-  "foda": {{
-    "fortalezas": ["2-3 puntos, máx. 25 palabras cada uno"],
-    "oportunidades": ["2-3 puntos"],
-    "debilidades": ["2-3 puntos"],
-    "amenazas": ["2-3 puntos"]
-  }},
-  "proyeccion": "Párrafo de 80-100 palabras sobre rol y sostenibilidad, coherente con la edad (fecha de nacimiento) y los datos.",
-  "similares": [
-    {{"nombre": "Jugador de perfil ESTADÍSTICO comparable, prioriza trayectoria ACB/Europa", "razon": "justificación técnica de una línea; preséntalo como perfil comparable, no equivalencia de nivel"}},
-    {{"nombre": "...", "razon": "..."}}
-  ]
-}}
-
-REGLAS DE RIGOR (obligatorias, prevalecen sobre todo lo demás):
-1. Compara SOLO pares de valores que estén AMBOS en el JSON. Si el homólogo de carrera de una métrica no existe, NO compares: describe el valor en solitario. Prohibido citar cualquier número que no aparezca literalmente en el JSON.
-2. Direccionalidad: TOV% y Pérdidas significan mejor cuanto MÁS BAJOS. TS%, eFG%, AST%, %2P, %3P, %TL y AST/BP significan mejor cuanto más altos. Un TOV% bajo (<13) en un exterior con AST% alto es seguridad de balón de élite: FORTALEZA, jamás debilidad.
-3. Ancla todo juicio de nivel ("élite", "top", "pobre") en "_rankings_liga" si existe; sin ranking que lo respalde, describe el dato sin calificarlo.
-4. Temporadas con PJ < 10 son muestra no significativa: exclúyelas de tendencias y no cites sus porcentajes.
-5. Prohibido mencionar defensa, lesiones, contratos, vestuario o minutos futuros si el JSON no contiene un dato que lo respalde. Cada punto del FODA debe citar al menos un número del JSON.
-6. En la tendencia de la trayectoria: di meseta, descenso o mejora según los números reales, no la narrativa amable. Un pico anterior seguido de valores menores es meseta o leve descenso, no "mejora"."""
-
-
-# ─── Render HTML determinista ─────────────────────────────────────────────────
-
-
-def _e(v: Any) -> str:
-    s = str(v if v is not None else "—").strip()
-    return html.escape("—" if s in ("", "–") else s)
-
-
-def _tabla(
-    titulo: str, filas: List[List[str]], cabecera: Optional[List[str]] = None
-) -> str:
-    if not filas:
-        return ""
-    th = ""
-    if cabecera:
-        celdas = "".join(
-            f'<th style="background-color:{COURT};color:{COURT_INK};padding:9px;'
-            f'text-align:center;font-size:12.5px;letter-spacing:1px;">{_e(c)}</th>'
-            for c in cabecera
-        )
-        th = f"<tr>{celdas}</tr>"
-    trs = ""
-    for fila in filas:
-        tds = "".join(
-            f'<td style="padding:8px;border-bottom:1px solid {LINE};'
-            f'text-align:center;font-size:13px;color:{INK};">{_e(c)}</td>'
-            for c in fila
-        )
-        trs += f"<tr>{tds}</tr>"
-    t = (
-        f'<h3 style="color:{INK};font-size:14.5px;margin:18px 0 8px;'
-        f'font-family:{FONT_BODY};">{_e(titulo)}</h3>'
-        if titulo
-        else ""
-    )
-    return t + f'<table style="width:100%;border-collapse:collapse;margin-bottom:20px;">{th}{trs}</table>'
-
-
-def _h2(texto: str) -> str:
-    return (
-        f'<h2 style="color:{BRAND};border-bottom:2px solid {ACCENT};'
-        f'padding-bottom:8px;font-size:19px;margin-top:28px;'
-        f'font-family:{FONT_BODY};">{_e(texto)}</h2>'
-    )
-
-
-# Orden y etiquetas de los promedios ACB.
-_ORDEN_STATS: List[Tuple[str, str]] = [
-    ("Partidos", "PJ"), ("Minutos", "MIN"), ("Puntos", "PTS"),
-    ("%2P", "%2P"), ("%3P", "%3P"), ("%TL", "%TL"),
-    ("Rebotes", "REB"), ("Asistencias", "AST"),
-    ("Recuperaciones", "REC"), ("Tapones", "TAP"), ("Valoración", "VAL"),
-]
-
-_ORDEN_P40: List[Tuple[str, str]] = [
-    ("Puntos", "PTS"), ("Rebotes", "REB"), ("Asistencias", "AST"),
-    ("Recuperaciones", "REC"), ("Tapones", "TAP"), ("Valoración", "VAL"),
-]
-
-# Nombres visibles de los rankings de liga.
-_NOMBRE_RANK = {
-    "Puntos": "puntos", "Rebotes": "rebotes", "Asistencias": "asistencias",
-    "Recuperaciones": "recuperaciones", "Tapones": "tapones",
-    "Valoración": "valoración", "Minutos": "minutos",
-    "%2P": "%2P", "%3P": "%3P", "%TL": "%TL", "Partidos": "partidos",
-}
-
-
-def _fila_stats(stats: Dict[str, Any], orden: List[Tuple[str, str]]):
-    presentes = [(k, et) for k, et in orden if stats.get(k) not in (None, "", "–")]
-    cab = [et for _, et in presentes]
-    fila = [str(stats.get(k)) for k, _ in presentes]
-    return cab, fila
-
-
-def _linea_rankings(stats: Dict[str, Any]) -> str:
-    ranks = stats.get("_rankings_liga") or {}
-    if not isinstance(ranks, dict) or not ranks:
-        return ""
-    partes = []
-    for k, v in ranks.items():
-        num = str(v).replace("#", "").strip().split()[0] if v else ""
-        if num:
-            partes.append(f"#{num} en {_NOMBRE_RANK.get(k, k)}")
-    if not partes:
-        return ""
-    return (
-        f'<p style="font-size:12.5px;color:{ACCENT_600};margin:-10px 0 16px;">'
-        f"Top de liga: {_e(' · '.join(partes[:6]))}</p>"
-    )
-
-
-def _tabla_avanzadas(avanz: Dict[str, Any]) -> str:
-    """
-    Aplana los bloques oficiales de acb.com en una tabla métrica→valor,
-    SIN duplicados (eFG%, TOV% y ORB% aparecen en dos bloques del sitio).
-    """
-    filas: List[List[str]] = []
-    vistas: set = set()
-    for bloque in ("Cuatro Factores", "Lanzamiento", "Manejo de Balón", "Puntos", "Rebotes"):
-        contenido = avanz.get(bloque)
-        if not isinstance(contenido, dict):
-            continue
-        for metrica, valor in contenido.items():
-            if metrica in vistas:
-                continue
-            vistas.add(metrica)
-            filas.append([metrica, str(valor)])
-    if avanz.get("PTS_100_posesiones"):
-        filas.append(["PTS/100 posesiones", str(avanz["PTS_100_posesiones"])])
-    if avanz.get("Posesiones_40min"):
-        filas.append(["Posesiones por 40'", str(avanz["Posesiones_40min"])])
-    if not filas:
-        return ""
-    tabla = _tabla(
-        "Estadísticas avanzadas (oficiales acb.com)", filas, ["Métrica", "Valor"]
-    )
-    leyenda = (
-        f'<p style="font-size:10.5px;color:{INK_SOFT};margin:-14px 0 20px;line-height:1.5;">'
+COMPETICION = Competicion(
+    nombre="Liga Endesa",
+    fuente="acb.com",
+    ambito_similares="la ACB y Europa",
+    minutos_normalizacion=40,
+    pj_minimo=10,
+    metricas_clave="Valoración, TS% y eFG% oficiales, Cuatro Factores y per-40",
+    contexto_metricas=(
+        '- "Valoración" es el índice oficial europeo (PIR), LA métrica de referencia en ACB.\n'
+        '- "avanzadas_oficiales" son estadísticas avanzadas OFICIALES de acb.com de la temporada de '
+        "referencia: Cuatro Factores (eFG%, ORB%, TOV%, FTr), manejo de balón (AST%, STL%, BLK%), "
+        "lanzamiento (TS%, 3PAr, PPT), puntos por 100 posesiones y ritmo.\n"
+        '- "rankings_liga" son los puestos del jugador en los rankings oficiales de la Liga Endesa: '
+        "úsalos, dan mucho contexto.\n"
+        '- "trayectoria" es la serie temporada a temporada de su carrera ACB, con el club de cada año: '
+        "úsala para el arco de carrera (evolución, picos, cambios de equipo y tendencia reciente).\n"
+        '- "records" son sus máximos en un partido de la Liga Endesa.'
+    ),
+    col_promedios=[
+        ("Partidos", "PJ"), ("Minutos", "MIN"), ("Puntos", "PTS"),
+        ("%2P", "%2P"), ("%3P", "%3P"), ("%TL", "%TL"),
+        ("Rebotes", "REB"), ("Asistencias", "AST"),
+        ("Recuperaciones", "REC"), ("Tapones", "TAP"), ("Valoración", "VAL"),
+    ],
+    col_normalizado=[
+        ("Puntos", "PTS"), ("Rebotes", "REB"), ("Asistencias", "AST"),
+        ("Recuperaciones", "REC"), ("Tapones", "TAP"), ("Valoración", "VAL"),
+    ],
+    col_trayectoria=[
+        ("Temporada", "Temp"), ("Club", "Club"), ("PJ", "PJ"), ("Minutos", "MIN"),
+        ("Puntos", "PTS"), ("%2P", "%2P"), ("%3P", "%3P"), ("%TL", "%TL"),
+        ("Rebotes", "REB"), ("Asistencias", "AST"), ("Valoración", "VAL"),
+    ],
+    titulo_avanzadas="Estadísticas avanzadas (oficiales acb.com)",
+    leyenda_avanzadas=(
         "eFG%: % de tiro efectivo · TS%: % de tiro real · FTr: tiros libres intentados por "
         "tiro de campo · 3PAr: proporción de intentos de 3 · TOV%: % de pérdidas por posesión · "
         "AST%/ORB%/DRB%/STL%/BLK%: % de asistencias, rebotes of./def., robos y tapones del "
         "equipo generados por el jugador · PPT: puntos por tiro · PPFT/PP2PS/PP3PS: puntos por "
-        "tiro libre / lanzamiento de 2 / lanzamiento de 3.</p>"
-    )
-    return tabla + leyenda
+        "tiro libre / lanzamiento de 2 / lanzamiento de 3."
+    ),
+    leyenda_ratios=(
+        "AST/BP: asistencias por pérdida, calculado por Basketmática. Pérdidas y triples "
+        "intentados por partido: datos oficiales de acb.com."
+    ),
+)
 
+_CAMPOS_PERFIL = [
+    "Posición", "Equipo", "Dorsal", "Altura", "Fecha nacimiento",
+    "Lugar nacimiento", "Nacionalidad", "Licencia",
+]
 
-def _seccion_foda(foda: Dict[str, List[str]]) -> str:
-    bloques = [
-        ("Fortalezas", FODA_FORTALEZAS, foda.get("fortalezas") or []),
-        ("Oportunidades", FODA_OPORTUNIDADES, foda.get("oportunidades") or []),
-        ("Debilidades", FODA_DEBILIDADES, foda.get("debilidades") or []),
-        ("Amenazas", FODA_AMENAZAS, foda.get("amenazas") or []),
-    ]
-    secciones = ""
-    for titulo, color, puntos in bloques:
-        lis = "".join(f"<li>{_e(p)}</li>" for p in puntos) or "<li>—</li>"
-        secciones += (
-            f'<section style="background-color:{SURFACE};border:1px solid {LINE};'
-            f'border-left:4px solid {color};padding:14px 16px;border-radius:6px;">'
-            f'<h3 style="color:{color};margin:0 0 8px;font-size:13.5px;'
-            f'text-transform:uppercase;letter-spacing:1px;">{titulo}</h3>'
-            f'<ul style="margin:0;padding-left:18px;font-size:13px;line-height:1.5;">{lis}</ul>'
-            f"</section>"
-        )
-    return (
-        '<div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;'
-        f'margin-bottom:24px;">{secciones}</div>'
-    )
 
 def _num_es(v: Any) -> Optional[float]:
     """'4,3' -> 4.3 | '89,9%' -> 89.9 | '22:05' -> 22.08 (min decimales)."""
@@ -268,167 +87,64 @@ def _num_es(v: Any) -> Optional[float]:
         return None
 
 
-def _ratios_calculados(est: Dict[str, Any]) -> Dict[str, str]:
-    """
-    Ratios derivados de la fila de la temporada actual en la trayectoria
-    (la única fuente de la ficha con pérdidas e intentos de tiro por partido).
-    Aritmética sobre datos reales; se etiqueta como 'calculado'.
-    """
-    tray = est.get("trayectoria") or []
+def _ratios(est: Dict[str, Any]) -> Dict[str, str]:
+    """Ratios de la fila de la temporada de referencia en la trayectoria (única fuente de pérdidas e intentos)."""
     label = str(est.get("temporada_label", ""))  # '2025-26' -> '25-26'
     corto = label[2:] if len(label) >= 7 else label
-    fila = next((t for t in tray if t.get("Temporada") == corto), None)
+    fila = next((t for t in est.get("trayectoria") or [] if t.get("Temporada") == corto), None)
     if fila is None:
         return {}
     out: Dict[str, str] = {}
     ast = _num_es(fila.get("Asistencias"))
     bp = _num_es(fila.get("Pérdidas"))
     if ast is not None and bp and bp > 0:
-        out["AST/BP"] = f"{ast / bp:.1f}".replace(".", ",")
+        out["AST/BP (calculado)"] = f"{ast / bp:.1f}"
     if fila.get("Pérdidas") not in (None, ""):
-        out["Pérdidas/partido"] = str(fila.get("Pérdidas"))
-    t3i = fila.get("T3_int")
-    if t3i not in (None, ""):
-        out["Triples intentados/partido"] = str(t3i)
+        out["Pérdidas/partido"] = str(fila["Pérdidas"])
+    if fila.get("T3_int") not in (None, ""):
+        out["Triples intentados/partido"] = str(fila["T3_int"])
     return out
 
 
-def render_html(player_data: Dict[str, Any], analisis: Dict[str, Any]) -> str:
+def _avanzadas_planas(avanz: Dict[str, Any]) -> Dict[str, str]:
+    """Aplana los bloques oficiales SIN duplicados (eFG%, TOV% y ORB% aparecen en dos bloques del sitio)."""
+    out: Dict[str, str] = {}
+    for bloque in ("Cuatro Factores", "Lanzamiento", "Manejo de Balón", "Puntos", "Rebotes"):
+        contenido = avanz.get(bloque)
+        if isinstance(contenido, dict):
+            for metrica, valor in contenido.items():
+                out.setdefault(metrica, str(valor))
+    if avanz.get("PTS_100_posesiones"):
+        out["PTS/100 posesiones"] = str(avanz["PTS_100_posesiones"])
+    if avanz.get("Posesiones_40min"):
+        out["Posesiones por 40'"] = str(avanz["Posesiones_40min"])
+    return out
+
+
+def construir_vista(player_data: Dict[str, Any]) -> Dict[str, Any]:
     bio = player_data.get("Datos personales", {})
     est = player_data.get("Estadísticas", {})
-    temporada_label = est.get("temporada_label", "")
-
-    # ── Cabecera ──
-    foto = bio.get("Foto") or ""
-    img = (
-        f'<img src="{html.escape(foto)}" alt="" '
-        f'style="max-width:150px;border-radius:8px;"/>' if foto else ""
-    )
-    cabecera = f"""
-    <div style="display:flex;align-items:center;gap:24px;border-bottom:3px solid {ACCENT};
-                padding-bottom:20px;margin-bottom:26px;">
-      {img}
-      <div>
-        <h1 style="color:{BRAND};margin:0 0 8px;font-size:28px;letter-spacing:.5px;
-                   font-family:{FONT_BODY};">{_e(bio.get("Nombre"))}</h1>
-        <p style="margin:0;font-size:16px;color:{INK_SOFT};">
-          {_e(bio.get("Posición"))} · {_e(bio.get("Equipo"))} · Dorsal {_e(bio.get("Dorsal"))}
-        </p>
-        <p style="margin:6px 0 0;font-size:11px;color:{ACCENT_600};
-                  text-transform:uppercase;letter-spacing:2px;">
-          Informe de scouting · Liga Endesa{f" · Temporada {_e(temporada_label)}" if temporada_label else ""}
-        </p>
-      </div>
-    </div>"""
-
-    # ── Perfil ──
-    campos_bio = [
-        "Equipo", "Posición", "Altura", "Fecha nacimiento", "Lugar nacimiento",
-        "Nacionalidad", "Licencia", "Dorsal",
-    ]
-    filas_bio = [
-        [c, str(bio.get(c))] for c in campos_bio if bio.get(c) not in (None, "", "–")
-    ]
-    perfil = _h2("Perfil del jugador") + _tabla("", filas_bio)
-
-    # ── Métricas ──
-    stats_html = _h2("Métricas de rendimiento")
+    norm = COMPETICION.clave_normalizado
     temp = est.get("temporada") or {}
-    if temp:
-        cab, fila = _fila_stats(temp, _ORDEN_STATS)
-        etiqueta = f"Promedios {temporada_label}" if temporada_label else "Promedios de la temporada"
-        stats_html += _tabla(etiqueta, [fila], cab)
-        stats_html += _linea_rankings(temp)
-        p40 = temp.get("per40") or {}
-        if p40:
-            cab, fila = _fila_stats(p40, _ORDEN_P40)
-            stats_html += _tabla("Per-40 minutos (calculado)", [fila], cab)
-            ratios = est.get("ratios_calculados") or {}
-            if ratios:
-                stats_html += _tabla(
-                    "Ratios y volumen (calculado)",
-                    [[k, v] for k, v in ratios.items()], ["Métrica", "Valor"],
-                )
-
     carrera = est.get("carrera") or {}
-    if carrera:
-        cab, fila = _fila_stats(carrera, _ORDEN_STATS)
-        stats_html += _tabla("Promedios de carrera en ACB", [fila], cab)
-
-    avanz = est.get("avanzadas") or {}
-    if avanz:
-        stats_html += _tabla_avanzadas(avanz)
-
-    trayectoria = est.get("trayectoria") or []
-    if len(trayectoria) >= 2:
-        filas = [
-            [t.get("Temporada", "—"), t.get("Club", "—"), t.get("PJ", "—"),
-             t.get("Minutos", "—"), t.get("Puntos", "—"), t.get("%2P", "—"),
-             t.get("%3P", "—"), t.get("%TL", "—"), t.get("Rebotes", "—"),
-             t.get("Asistencias", "—"), t.get("Valoración", "—")]
-            for t in trayectoria[:12]
-        ]
-        titulo_tray = "Trayectoria en ACB temporada a temporada"
-        if len(trayectoria) > 12:
-            titulo_tray += f" (últimas 12 de {len(trayectoria)})"
-        stats_html += _tabla(
-            titulo_tray, filas,
-            ["Temp", "Club", "PJ", "MIN", "PTS", "%2P", "%3P", "%TL", "REB", "AST", "VAL"],
-        )
-
-    records = est.get("records") or {}
-    if records:
-        filas = [
-            [met, str(d.get("valor", "—")), str(d.get("partido", "—"))]
-            for met, d in records.items()
-            if isinstance(d, dict)
-        ]
-        stats_html += _tabla(
-            "Récords en un partido", filas, ["Métrica", "Valor", "Partido"]
-        )
-
-    # ── Análisis del LLM ──
-    analisis_html = (
-        _h2("Análisis de desempeño")
-        + f'<p style="font-size:13.5px;line-height:1.6;">{_e(analisis.get("resumen_desempeno"))}</p>'
-        + _h2("Análisis FODA")
-        + _seccion_foda(analisis.get("foda") or {})
-        + _h2("Proyección")
-        + f'<p style="font-size:13.5px;line-height:1.6;">{_e(analisis.get("proyeccion"))}</p>'
-        + _h2("Perfiles similares")
-        + "<ul style='font-size:13.5px;line-height:1.7;'>"
-        + "".join(
-            f"<li><strong>{_e(s.get('nombre'))}</strong>: {_e(s.get('razon'))}</li>"
-            for s in (analisis.get("similares") or [])
-            if isinstance(s, dict)
-        )
-        + "</ul>"
-    )
-
-    modelo = _e(analisis.get("_modelo", ""))
-    pie = (
-        f'<p style="margin-top:32px;padding-top:12px;border-top:1px solid {ACCENT};'
-        f'font-size:10.5px;color:{INK_SOFT};text-transform:uppercase;letter-spacing:2px;">'
-        f"Basketmática · basketmatica.com · Datos: acb.com · Análisis: {modelo}</p>"
-    )
-
-    return f"""<!DOCTYPE html>
-<html lang="es"><head><meta charset="utf-8"></head>
-<body style="background-color:{BG};margin:0;
-             font-family:{FONT_BODY};line-height:1.55;color:{INK};">
-  <div style="max-width:850px;margin:0 auto;padding:40px;background-color:{BG};position:relative;">
-    <img src="{LOGO_URL}" alt="Basketmática"
-         style="position:absolute;top:40px;right:40px;width:90px;opacity:.85;"/>
-    {cabecera}
-    {perfil}
-    {stats_html}
-    {analisis_html}
-    {pie}
-  </div>
-</body></html>"""
-
-
-# ─── Pipeline principal ───────────────────────────────────────────────────────
+    slug = re.search(r"/jugadores/([a-z0-9-]+)-\d+/?$", str(bio.get("Ficha_acb", "")))
+    return {
+        "jugador": {"Nombre": bio.get("Nombre"), **{c: bio.get(c) for c in _CAMPOS_PERFIL}},
+        "alias": [slug.group(1).replace("-", " ")] if slug else [],
+        "foto": bio.get("Foto"),
+        "temporada": {
+            "etiqueta": est.get("temporada_label", ""),
+            "promedios": temp,
+            "rankings_liga": temp.get("_rankings_liga"),
+            norm: temp.get("per40"),
+            "ratios": _ratios(est),
+        },
+        "carrera": {"promedios": carrera, norm: carrera.get("per40")},
+        "avanzadas_oficiales": _avanzadas_planas(est.get("avanzadas") or {}),
+        "trayectoria": est.get("trayectoria"),
+        "records": est.get("records"),
+        "nota_temporada": est.get("_nota_temporada"),
+    }
 
 
 def generar_pdf_jugador_acb(
@@ -447,22 +163,6 @@ def generar_pdf_jugador_acb(
     RuntimeError      Errores transitorios de red / API.
     """
     logger.info("=== Informe ACB para: '%s' ===", nombre_jugador)
-
     if player_data is None:
         player_data = obtener_datos_jugador_acb(nombre_jugador, indice=indice)
-
-    analisis = generar_json(
-        _prompt_analisis(player_data),
-        proveedores,
-        system=_SYSTEM,
-        max_tokens=3500,
-    )
-
-    est = player_data.get("Estadísticas", {})
-    ratios = _ratios_calculados(est)
-    if ratios:
-        est["ratios_calculados"] = ratios
-    html_doc = render_html(player_data, analisis)
-    pdf: bytes = HTML(string=html_doc).write_pdf()
-    logger.info("✓ PDF generado (%d KB).", len(pdf) // 1024)
-    return pdf
+    return generar_pdf(construir_vista(player_data), COMPETICION, proveedores)

@@ -801,9 +801,9 @@ def obtener_datos_jugador_acb(
         )
         if ficha.get("temporada_label") != label_actual:
             nota_temporada = (
-                f"La temporada {label_actual} aún no tiene partidos disputados: "
-                f"'temporada' corresponde a {ficha.get('temporada_label')}, "
-                "la última temporada completa del jugador."
+                f"Sin partidos disputados en la temporada {label_actual}: los datos de "
+                f"'temporada' corresponden a {ficha.get('temporada_label')}, su última "
+                "temporada con partidos."
             )
             logger.info("Temporada %s vacía → usando %s", label_actual, ficha.get("temporada_label"))
 
