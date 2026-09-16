@@ -74,6 +74,7 @@ CONTEXTO DE MÉTRICAS (para interpretar, NO para inventar valores):
 - "avanzadas" son estadísticas avanzadas OFICIALES de acb.com: Cuatro Factores (eFG%, ORB%, TOV%, FTr), manejo de balón (AST%, STL%, BLK%, TOV%), lanzamiento (TS%, eFG%, 3PAr, PPT), puntos por 100 posesiones y ritmo.
 - "per40" es la normalización europea a 40 minutos, calculada sobre promedios reales.
 - "_rankings_liga" son los puestos del jugador en los rankings oficiales de la Liga Endesa: úsalos, dan mucho contexto.
+- Si existe "_nota_temporada", la temporada en curso aún no ha empezado y "temporada" es la última completa: no interpretes la temporada nueva como ausencia o falta de participación del jugador.
 - "trayectoria" es la serie temporada a temporada de TODA su carrera ACB (con el club de cada año): úsala para el arco de carrera — evolución, picos, cesiones o cambios de equipo, y tendencia reciente.
 
 Devuelve EXACTAMENTE este esquema JSON (sin campos extra, sin Markdown):

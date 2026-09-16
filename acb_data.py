@@ -693,6 +693,61 @@ def _per40(stats: Dict[str, str]) -> Dict[str, str]:
     return out
 
 
+# ─── Temporada de referencia: la actual o, si está vacía, la última con datos ─
+
+# Fila de la trayectoria → claves del bloque 'temporada' de la ficha.
+_TRAYECTORIA_A_TEMPORADA = {
+    "PJ": "Partidos", "Minutos": "Minutos", "Puntos": "Puntos",
+    "%2P": "%2P", "%3P": "%3P", "%TL": "%TL", "Rebotes": "Rebotes",
+    "Asistencias": "Asistencias", "Tap_favor": "Tapones",
+    "Recuperaciones": "Recuperaciones", "Valoración": "Valoración",
+}
+
+
+def _partidos(stats: Optional[Dict[str, Any]]) -> float:
+    stats = stats or {}
+    return _num(str(stats.get("Partidos") or stats.get("PJ") or "")) or 0.0
+
+
+def _anio_inicio(temporada_corta: str) -> int:
+    yy = int(temporada_corta[:2])
+    return 2000 + yy if yy < 50 else 1900 + yy
+
+
+def _usar_ultima_temporada_con_datos(
+    url: str, html_ficha: str, ficha: Dict[str, Any], trayectoria: List[Dict[str, str]]
+) -> Tuple[str, Dict[str, Any]]:
+    """
+    En pretemporada la ficha muestra la temporada nueva a cero. Devuelve
+    (sufijo '?editionId=N', ficha) con la última temporada con partidos.
+    """
+    fila = next((t for t in trayectoria if _partidos(t) > 0), None)
+    label = ficha.get("temporada_label", "")
+    if fila is None or not re.match(r"^\d{4}-\d{2}$", label):
+        return "", ficha
+    label_objetivo = f"{_anio_inicio(fila['Temporada'])}-{fila['Temporada'][3:]}"
+
+    # editionId es correlativo por temporada (2025-26 → 90, 2026-27 → 91).
+    ids = [int(x) for x in re.findall(r'editionId[=\\":]+(\d+)', html_ficha)]
+    if ids:
+        sufijo = f"?editionId={max(ids) - (int(label[:4]) - _anio_inicio(fila['Temporada']))}"
+        try:
+            previa = _parse_ficha(_get_html(url + sufijo))
+            if previa.get("temporada_label") == label_objetivo and _partidos(previa.get("temporada")) > 0:
+                return sufijo, {**ficha, "temporada_label": label_objetivo, "temporada": previa["temporada"]}
+        except Exception as exc:
+            logger.warning("Ficha de %s no accesible (%s): %s", label_objetivo, sufijo, exc)
+
+    # Respaldo sin avanzadas ni rankings: la fila de la trayectoria.
+    logger.warning("editionId de %s no verificado → promedios desde la trayectoria", label_objetivo)
+    temporada = {
+        dest: fila[orig].replace(".", ",")
+        for orig, dest in _TRAYECTORIA_A_TEMPORADA.items()
+        if fila.get(orig)
+    }
+    return "", {**ficha, "temporada_label": label_objetivo, "temporada": temporada}
+
+
 # ─── API pública ──────────────────────────────────────────────────────────────
 
 
@@ -728,19 +783,37 @@ def obtener_datos_jugador_acb(
     entrada = resolver_jugador(nombre, indice)
     logger.info("✓ Resuelto '%s' → %s (%s)", nombre, entrada["slug"], entrada["url"])
 
-    ficha = _parse_ficha(_get_html(entrada["url"]))
-
-    avanzadas: Dict[str, Any] = {}
-    try:
-        avanzadas = _parse_avanzadas(_get_html(f"{entrada['url']}/estadisticas-avanzadas"))
-    except Exception as exc:
-        logger.warning("Avanzadas no disponibles para %s: %s", entrada["slug"], exc)
+    html_ficha = _get_html(entrada["url"])
+    ficha = _parse_ficha(html_ficha)
 
     trayectoria: List[Dict[str, str]] = []
     try:
         trayectoria = _parse_temporadas(_get_html(f"{entrada['url']}/temporada"))
     except Exception as exc:
         logger.warning("Trayectoria no disponible para %s: %s", entrada["slug"], exc)
+
+    sufijo_edicion = ""
+    nota_temporada = ""
+    label_actual = ficha.get("temporada_label", "")
+    if _partidos(ficha.get("temporada")) <= 0:
+        sufijo_edicion, ficha = _usar_ultima_temporada_con_datos(
+            entrada["url"], html_ficha, ficha, trayectoria
+        )
+        if ficha.get("temporada_label") != label_actual:
+            nota_temporada = (
+                f"La temporada {label_actual} aún no tiene partidos disputados: "
+                f"'temporada' corresponde a {ficha.get('temporada_label')}, "
+                "la última temporada completa del jugador."
+            )
+            logger.info("Temporada %s vacía → usando %s", label_actual, ficha.get("temporada_label"))
+
+    avanzadas: Dict[str, Any] = {}
+    try:
+        avanzadas = _parse_avanzadas(
+            _get_html(f"{entrada['url']}/estadisticas-avanzadas{sufijo_edicion}")
+        )
+    except Exception as exc:
+        logger.warning("Avanzadas no disponibles para %s: %s", entrada["slug"], exc)
 
     bio_raw = ficha.get("bio", {})
     nombre_display = entrada.get("display") or entrada["slug"].replace("-", " ").title()
@@ -770,6 +843,8 @@ def obtener_datos_jugador_acb(
     estadisticas: Dict[str, Any] = {"_fuente": "acb.com (ficha oficial del jugador)"}
     if ficha.get("temporada_label"):
         estadisticas["temporada_label"] = ficha["temporada_label"]
+    if nota_temporada:
+        estadisticas["_nota_temporada"] = nota_temporada
     if ficha.get("temporada"):
         temp = dict(ficha["temporada"])
         p40 = _per40(temp)
