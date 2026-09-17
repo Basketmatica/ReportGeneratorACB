@@ -34,7 +34,7 @@ logger = logging.getLogger("acb-report")
 
 from acb_data import construir_indice_jugadores, obtener_datos_jugador_acb  # noqa: E402
 from informe_comun import preparar_vista  # noqa: E402
-from llm_client import cargar_proveedores  # noqa: E402
+from llm_client import SinCapacidad, cargar_proveedores  # noqa: E402
 from report_acb import COMPETICION, construir_vista, generar_pdf_jugador_acb  # noqa: E402
 
 # ─── Design tokens (espejo de :root en global.css) ────────────────────────────
@@ -251,8 +251,20 @@ if enviar:
         st.error(str(exc))
     except EnvironmentError as exc:
         st.error(str(exc))
+    except SinCapacidad as exc:
+        logger.warning("Sin cuota de LLM disponible: %s", exc)
+        st.warning(
+            "⏳ **Ahora mismo hay más demanda de la que podemos atender.** El "
+            "análisis lo redacta un servicio de IA con cupo gratuito y está al "
+            "límite. Vuelve a intentarlo en unos minutos; los informes generados "
+            "hoy se descargan al instante."
+        )
     except RuntimeError as exc:
-        st.error(f"Error transitorio: {exc}. Inténtalo de nuevo en unos segundos.")
+        logger.warning("Error transitorio generando informe: %s", exc)
+        st.error(
+            "No hemos podido generar el informe en este momento. "
+            "Inténtalo de nuevo en unos segundos."
+        )
     except Exception:
         logger.exception("Error inesperado generando informe para '%s'", nombre)
         st.error("Error interno al generar el informe. Inténtalo de nuevo más tarde.")

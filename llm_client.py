@@ -85,6 +85,10 @@ def _espera_429(r: httpx.Response, reintento: int) -> Optional[float]:
     return espera + 0.5 if espera <= ESPERA_MAX_429_S else None
 
 
+class SinCapacidad(RuntimeError):
+    """Todos los proveedores han agotado su cuota (429) o no tienen saldo (402)."""
+
+
 @dataclass
 class ProviderConfig:
     name: str
@@ -158,6 +162,7 @@ def generar_json(
         )
 
     errores: List[str] = []
+    sin_cuota: List[bool] = []
     for prov in proveedores:
         payload: Dict[str, Any] = {
             "model": prov.model,
@@ -194,6 +199,7 @@ def generar_json(
                 )
             except httpx.HTTPError as exc:
                 errores.append(f"{prov.name}: red ({exc.__class__.__name__})")
+                sin_cuota.append(False)
                 break  # siguiente proveedor
             if r.status_code == 200:
                 try:
@@ -207,6 +213,7 @@ def generar_json(
                     return resultado
                 except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
                     errores.append(f"{prov.name}: respuesta inválida ({exc})")
+                    sin_cuota.append(False)
                     break
             if r.status_code == 400 and usar_response_format:
                 usar_response_format = False
@@ -222,12 +229,17 @@ def generar_json(
                     time.sleep(espera)
                     continue
                 errores.append(f"{prov.name}: rate limit (429)")
+            elif r.status_code == 402:
+                # Cerebras: clave de una org "Team" sin saldo; la gratuita es la de la cuenta Personal.
+                errores.append(f"{prov.name}: sin saldo o clave de pago (402)")
             elif r.status_code in (401, 403):
                 errores.append(f"{prov.name}: clave inválida (HTTP {r.status_code})")
             else:
                 errores.append(f"{prov.name}: HTTP {r.status_code}")
+            sin_cuota.append(r.status_code in (429, 402))
             break  # siguiente proveedor
 
-    raise RuntimeError(
-        "Todos los proveedores de LLM fallaron: " + " · ".join(errores)
-    )
+    detalle = "Todos los proveedores de LLM fallaron: " + " · ".join(errores)
+    if sin_cuota and all(sin_cuota):
+        raise SinCapacidad(detalle)
+    raise RuntimeError(detalle)
