@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import re
+import time
 import unicodedata
 
 import streamlit as st
@@ -197,6 +198,31 @@ def _safe_filename(name: str) -> str:
     return s or "Jugador"
 
 
+# ─── Rate limit por sesión (anti-ráfaga, no anti-uso) ──────────────────────────
+#
+# Objetivo: no penalizar a una persona que genera muchos informes a ritmo
+# humano (uno, lee, descarga, pasa al siguiente...), pero cortar ráfagas tipo
+# script que agotarían el cupo gratuito de los proveedores de LLM en segundos.
+# Vive en st.session_state, así que es por sesión de navegador: nunca bloquea
+# a otras personas ni al resto de sesiones.
+RATE_LIMIT_VENTANA_S = 300  # ventana deslizante: 5 minutos
+RATE_LIMIT_MAX_EN_VENTANA = 5  # informes permitidos dentro de esa ventana
+RATE_LIMIT_INTERVALO_MIN_S = 5  # separación mínima entre dos generaciones
+
+
+def _rate_limit_espera() -> float:
+    """Segundos que hay que esperar antes de generar otro informe (0 = ya se puede)."""
+    ahora = time.monotonic()
+    ts = st.session_state.setdefault("informes_ts", [])
+    ts[:] = [t for t in ts if ahora - t < RATE_LIMIT_VENTANA_S]
+
+    if ts and ahora - ts[-1] < RATE_LIMIT_INTERVALO_MIN_S:
+        return RATE_LIMIT_INTERVALO_MIN_S - (ahora - ts[-1])
+    if len(ts) >= RATE_LIMIT_MAX_EN_VENTANA:
+        return RATE_LIMIT_VENTANA_S - (ahora - ts[0])
+    return 0.0
+
+
 # ─── UI ───────────────────────────────────────────────────────────────────────
 
 st.markdown('<p class="bm-kicker">Basketmática · Herramienta</p>', unsafe_allow_html=True)
@@ -215,6 +241,16 @@ if enviar:
     if len(nombre) < 2:
         st.error("Escribe un nombre válido (mínimo 2 caracteres).")
         st.stop()
+
+    espera = _rate_limit_espera()
+    if espera > 0:
+        st.warning(
+            f"⏳ Vas un poco rápido: espera unos {int(espera) + 1} s antes de "
+            "generar otro informe. Así dejamos cupo del servicio de IA para "
+            "el resto de gente que usa la herramienta."
+        )
+        st.stop()
+    st.session_state["informes_ts"].append(time.monotonic())
 
     proveedores = cargar_proveedores({**os.environ, **st.secrets})
 
